@@ -1,0 +1,65 @@
+# =============================================================
+# clock-rtc-pcf8563.yaml — optional add-on package for clocks fitted with a
+# battery-backed PCF8563T RTC module. Include it AFTER clock-common.yaml:
+#
+#   packages:
+#     common: !include clock-common.yaml
+#     rtc:    !include clock-rtc-pcf8563.yaml
+#
+# It adds the I2C bus and the pcf8563 time platform, reads the RTC into the
+# system clock at boot, and extends two entities from clock-common.yaml by id
+# (!extend) so the RTC is rewritten on every NTP sync and every manual set.
+# On these clocks the flash-based estimate in clock-common.yaml never shows,
+# because the RTC makes the time valid before the first display refresh; it
+# only reappears if the RTC battery dies ("RTC halted" in the log).
+#
+# Wiring: VCC -> 3V3 (NOT 5V: the module's pull-ups would drag SDA/SCL to
+# 5V), GND -> GND, SDA -> ${i2c_sda}, SCL -> ${i2c_scl}. Fixed I2C address
+# 0x51. The pin defaults (i2c_sda / i2c_scl) live in the substitutions block
+# of clock-common.yaml; override them in the device file if wired differently.
+# =============================================================
+
+substitutions:
+  friendly_name: "Clock PCF8563"
+
+esphome:
+  friendly_name: "${friendly_name}"
+  on_boot:
+    - priority: 600
+      then:
+        # Seed the system clock from the RTC before WiFi/NTP are up. Skipped
+        # with a "RTC halted" warning if the PCF8563 reports its oscillator
+        # stopped (first boot, or dead battery); the clock then behaves
+        # exactly like one without an RTC (estimate, then NTP / manual set).
+        - pcf8563.read_time: rtc_time
+
+# scan: true logs the devices found at boot; expect
+# "Found i2c device at address 0x51" if the wiring is right.
+i2c:
+  - id: bus_a
+    sda: ${i2c_sda}
+    scl: ${i2c_scl}
+    frequency: 100kHz
+    scan: true
+
+time:
+  # Read once at boot (see on_boot above) and written on every NTP sync and
+  # every manual set. No periodic re-read: while running, the ESP32's own
+  # clock is about as accurate as the PCF8563.
+  - platform: pcf8563
+    id: rtc_time
+    i2c_id: bus_a
+    address: 0x51
+    timezone: ${timezone}
+    update_interval: never
+  # Extend the NTP source defined in clock-common.yaml: keep the RTC current
+  - id: !extend sntp_time
+    on_time_sync:
+      then:
+        - pcf8563.write_time: rtc_time
+
+datetime:
+  # Extend "Set Date & Time" from clock-common.yaml: persist manual sets
+  - id: !extend set_datetime_ctl
+    set_action:
+      - pcf8563.write_time: rtc_time

@@ -1,0 +1,583 @@
+# =============================================================
+# clock-common.yaml — shared package for all ESP32-C6 LED clocks
+#
+# Per-device files only set substitutions and include this file:
+#
+#   packages:
+#     common: !include clock-common.yaml
+#     rtc:    !include clock-rtc-pcf8563.yaml   # only on clocks with the module
+#
+# Substitutions in the device file OVERRIDE the defaults below.
+# This file never refers to the RTC; clock-rtc-pcf8563.yaml adds itself by
+# merging into the entities below by id (sntp_time, set_datetime_ctl).
+#
+# Brightness model: linear ramp on sun elevation.
+#   elevation <= ${elevation_night}  ->  ${brightness_night}
+#   elevation >= ${elevation_day}    ->  ${brightness_day}
+#   in between                       ->  linear interpolation
+# Re-evaluated every 60s while the "Auto Brightness" switch is on.
+#
+# Timekeeping, in order of quality (any one of them is enough):
+#   1. NTP via WiFi when an NTP server is reachable.
+#   2. Battery-backed PCF8563T RTC module (optional package, see above):
+#      seeds the system clock at boot, rewritten on every NTP sync and
+#      every manual set.
+#   3. Manual: the built-in web UI (http://<device-ip>/) exposes
+#      "Set Date & Time", "Time Zone" and "UTC Offset" controls for sites
+#      without an NTP server. Set the time zone FIRST, then the date/time
+#      (the entered time is interpreted in the selected zone). "UTC Offset"
+#      is used, and editable, only while the zone is "Fixed UTC offset";
+#      with a named zone selected any edit to it is reverted. The zone and
+#      offset are stored in flash and re-applied at every boot.
+#   4. Last resort, clocks without an RTC: the last known good time is saved
+#      to flash every 10s (global saved_epoch). After a power cycle the
+#      display shows saved time + uptime with a STEADY colon until a real
+#      source (NTP, RTC or manual set) is available; the colon then blinks.
+#      That estimate is stale by however long the power was off, and it is
+#      never written to the system clock, so "Current Time" in HA and the
+#      sun-brightness script keep treating time as unknown until it is known.
+#   The ESP32-C6 keeps system time across soft reboots (restart button, OTA)
+#   in RTC registers, so 2 and 4 only matter after a power cycle.
+# =============================================================
+
+substitutions:
+  # ---- defaults (override per device as needed) ----
+  # seeed_xiao_esp32c  /  esp32-c6-devkitc-1
+  board: esp32-c6-devkitc-1
+  device_name: clock-common
+  friendly_name: "Clock Common"
+  led_pin: GPIO4
+  num_leds: "116"
+  strip_reverse: "true"
+  # 4 digits, 4 LEDs per segment, ":..:" separator (clocks 2-4 layout)
+  led_map: "GGGGBBBBAAAAFFFFEEEEDDDDCCCC GGGGBBBBAAAAFFFFEEEEDDDDCCCC :..: GGGGBBBBAAAAFFFFEEEEDDDDCCCC GGGGBBBBAAAAFFFFEEEEDDDDCCCC"
+  # Brightness as fractions 0.0-1.0 (was "40%" / "15%")
+  brightness_day: "0.40"
+  brightness_night: "0.15"
+  # Ramp endpoints in degrees of sun elevation:
+  # -6.0 = civil twilight ends (fully dark for practical purposes)
+  # 10.0 = sun well up, full daytime ambient light
+  elevation_night: "-6.0"
+  elevation_day: "10.0"
+  # Compile-time zone (also enables ESPHome's timezone engine). At runtime the
+  # "Time Zone" control below always overrides it; tz_default_option is what
+  # that control starts with on a fresh device and should name the same zone.
+  timezone: America/Chicago
+  tz_default_option: "US Central (UTC-6)"
+  # I2C pins for the optional PCF8563T RTC module (used only by
+  # clock-rtc-pcf8563.yaml). GPIO6/GPIO7 are free on the C6 DevKitC-1 (its
+  # low-power I2C pins); avoid GPIO8/9/15 strapping pins, GPIO12/13 USB,
+  # GPIO16/17 UART0.
+  i2c_sda: GPIO6
+  i2c_scl: GPIO7
+  # Auto-reboot when no Home Assistant API client connects within this time.
+  api_reboot_timeout: 15min
+  # For clocks WITHOUT Home Assistant, disable that reboot by setting the
+  # substitution to 0s in the device file (or replace the line above):
+  # api_reboot_timeout: 0s
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  compile_process_limit: 18
+  min_version: "2026.9.0"
+  on_boot:
+    - priority: 600
+      then:
+        - wait_until:
+            condition:
+              lambda: 'return id(sntp_time).now().is_valid();'
+            timeout: 60s
+        - script.execute: apply_sun_brightness
+    - priority: -100
+      then:
+        # Everything is set up and "Time Zone" / "UTC Offset" have restored
+        # their stored values: apply the user's zone over the compiled-in one.
+        - script.execute: apply_timezone
+
+globals:
+  - id: last_brightness
+    type: float
+    initial_value: "-1.0"
+  # Last known good time (UTC epoch seconds), persisted to NVS flash so a clock
+  # without an RTC has something sensible to show right after a power cycle.
+  # The RAM copy is refreshed every 10s (see interval:). ESPHome only flushes
+  # changed preferences to flash once per minute (preferences.flash_write_interval,
+  # default 60s) and skips the write if the stored value is unchanged, so this
+  # costs at most one small NVS write per minute.
+  - id: saved_epoch
+    type: uint32_t
+    restore_value: yes
+    initial_value: "0"
+  # Last accepted value of the "UTC Offset" control (hours east of UTC), used to
+  # revert edits made while a named time zone is selected. Not persisted: the
+  # control itself restores its value from flash at boot.
+  - id: tz_fixed_hours
+    type: float
+    initial_value: "NAN"
+  # Boot IP splash (see the display lambda): display frames shown so far
+  # (-1 = waiting for an address) and the address being shown.
+  - id: ip_splash_frame
+    type: int
+    initial_value: "-1"
+  - id: ip_octets
+    type: std::array<uint8_t, 4>
+
+script:
+  - id: apply_sun_brightness
+    mode: restart
+    then:
+      - lambda: |-
+          if (!id(sntp_time).now().is_valid()) return;
+          const float e_night = ${elevation_night};
+          const float e_day   = ${elevation_day};
+          const float b_night = ${brightness_night};
+          const float b_day   = ${brightness_day};
+          float e = id(sun_comp).elevation();
+          float f = (e - e_night) / (e_day - e_night);
+          f = clamp(f, 0.0f, 1.0f);
+          float b = b_night + f * (b_day - b_night);
+          // Skip no-op updates (ramp moves slowly; avoids log/HA spam)
+          if (fabsf(b - id(last_brightness)) < 0.005f) return;
+          id(last_brightness) = b;
+          ESP_LOGD("sun_dim", "Sun elevation %.1f deg -> brightness %.0f%%", e, b * 100.0f);
+          auto call = id(digital_clock_light).turn_on();
+          call.set_brightness(b);
+          call.set_transition_length(1000);
+          call.perform();
+
+  # Translate the "Time Zone" selection into ESPHome's runtime timezone.
+  # ESPHome has its own POSIX-TZ engine (time::ParsedTimezone, applied with
+  # time::set_global_tz); the POSIX strings are parsed only at compile time,
+  # so each zone is spelled out here as offset + DST rules.
+  #   Offsets are seconds WEST of UTC (POSIX sign): US Central = +21600,
+  #   Central Europe = -3600. DST rules are POSIX "Mm.w.d/time": month,
+  #   week (5 = last), weekday (0 = Sunday), seconds after local midnight.
+  - id: apply_timezone
+    mode: restart
+    then:
+      - lambda: |-
+          using time::DSTRule;
+          using time::DSTRuleType;
+          using time::ParsedTimezone;
+          auto rule = [](uint8_t month, uint8_t week, uint8_t dow, int32_t secs) {
+            DSTRule r{};
+            r.type = DSTRuleType::MONTH_WEEK_DAY;
+            r.month = month;
+            r.week = week;
+            r.day_of_week = dow;
+            r.time_seconds = secs;
+            return r;
+          };
+          auto fixed = [](int32_t west_secs) {
+            ParsedTimezone t{};
+            t.std_offset_seconds = west_secs;
+            t.dst_offset_seconds = west_secs;
+            return t;
+          };
+          auto with_dst = [](int32_t std_west_secs, DSTRule start, DSTRule end) {
+            ParsedTimezone t{};
+            t.std_offset_seconds = std_west_secs;
+            t.dst_offset_seconds = std_west_secs - 3600;  // DST = one hour further east
+            t.dst_start = start;
+            t.dst_end = end;
+            return t;
+          };
+          const DSTRule us_start = rule(3, 2, 0, 7200);   // 2nd Sunday of March, 02:00
+          const DSTRule us_end   = rule(11, 1, 0, 7200);  // 1st Sunday of November, 02:00
+
+          // Select entities expose the chosen option as a StringRef (no .state
+          // member since ESPHome 2026.8); copy it into a std::string to compare.
+          const std::string sel = id(tz_select).current_option().str();
+          if (sel.empty()) return;  // not restored yet; on_boot applies it later
+          ParsedTimezone tz{};
+          // The strings below must match the "Time Zone" options list exactly.
+          if (sel == "US Eastern (UTC-5)") {
+            tz = with_dst(5 * 3600, us_start, us_end);                        // EST5EDT,M3.2.0,M11.1.0
+          } else if (sel == "US Central (UTC-6)") {
+            tz = with_dst(6 * 3600, us_start, us_end);                        // CST6CDT,M3.2.0,M11.1.0
+          } else if (sel == "US Mountain (UTC-7)") {
+            tz = with_dst(7 * 3600, us_start, us_end);                        // MST7MDT,M3.2.0,M11.1.0
+          } else if (sel == "US Arizona (UTC-7, no DST)") {
+            tz = fixed(7 * 3600);                                             // MST7
+          } else if (sel == "US Pacific (UTC-8)") {
+            tz = with_dst(8 * 3600, us_start, us_end);                        // PST8PDT,M3.2.0,M11.1.0
+          } else if (sel == "US Alaska (UTC-9)") {
+            tz = with_dst(9 * 3600, us_start, us_end);                        // AKST9AKDT,M3.2.0,M11.1.0
+          } else if (sel == "US Hawaii (UTC-10, no DST)") {
+            tz = fixed(10 * 3600);                                            // HST10
+          } else if (sel == "UTC") {
+            tz = fixed(0);                                                    // UTC0
+          } else if (sel == "UK / Ireland / Portugal (UTC+0)") {
+            tz = with_dst(0, rule(3, 5, 0, 3600), rule(10, 5, 0, 7200));      // GMT0BST,M3.5.0/1,M10.5.0
+          } else if (sel == "Europe Central (UTC+1)") {
+            // CET/CEST: Poland, Germany, France, Italy, Spain, ...
+            tz = with_dst(-1 * 3600, rule(3, 5, 0, 7200), rule(10, 5, 0, 10800));  // CET-1CEST,M3.5.0,M10.5.0/3
+          } else if (sel == "Europe Eastern (UTC+2)") {
+            // EET/EEST: Ukraine, Finland, Romania, Bulgaria, Greece, ... Ukraine still
+            // follows this EU DST schedule; a 2024 bill to abolish DST there was not
+            // enacted. If that changes, use "Fixed UTC offset" +2 instead.
+            tz = with_dst(-2 * 3600, rule(3, 5, 0, 10800), rule(10, 5, 0, 14400)); // EET-2EEST,M3.5.0/3,M10.5.0/4
+          } else if (sel == "Fixed UTC offset") {
+            // "UTC Offset" control: hours EAST of UTC (ISO sign, e.g. -6, +1, +5.5)
+            tz = fixed((int32_t) lroundf(-id(tz_fixed_offset).state * 3600.0f));
+          } else {
+            ESP_LOGW("tz", "Unknown time zone option '%s'", sel.c_str());
+            return;
+          }
+          time::set_global_tz(tz);
+          ESP_LOGI("tz", "Time zone: %s (standard time UTC%+.2f h%s)", sel.c_str(),
+                   -tz.std_offset_seconds / 3600.0f, tz.has_dst() ? ", with DST" : "");
+      - component.update: current_time_text
+
+switch:
+  - platform: template
+    name: "Auto Brightness"
+    id: auto_brightness
+    icon: "mdi:brightness-auto"
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      # Forget the last applied value so the script re-applies it even when it
+      # matches: the brightness may have been changed by hand while auto was off.
+      - lambda: 'id(last_brightness) = -1.0f;'
+      - script.execute: apply_sun_brightness
+
+interval:
+  - interval: 60s
+    then:
+      - if:
+          condition:
+            switch.is_on: auto_brightness
+          then:
+            - script.execute: apply_sun_brightness
+  # Remember the current time while it is known to be good (NTP, RTC or manual).
+  # Never captures the cold-boot estimate, because that never makes now() valid.
+  - interval: 10s
+    then:
+      - lambda: |-
+          auto now = id(sntp_time).now();
+          if (now.is_valid()) id(saved_epoch) = (uint32_t) now.timestamp;
+
+esp32:
+  board: ${board} 
+  #variant: esp32c6
+#  toolchain: esp-idf  # or 'platformio' (default)
+#  flash_size: 4MB
+  framework:
+    type: esp-idf
+#    version: 5.5.4
+#    release: "" # https://github.com/pioarduino/esp-idf/releases/
+#    platform_version: 55.03.38-1 # https://github.com/pioarduino/platform-espressif32/releases
+
+logger:
+  level: DEBUG
+
+debug:
+  update_interval: 10min
+
+api:
+  encryption:
+    key: !secret api_key
+  reboot_timeout: ${api_reboot_timeout}
+
+ota:
+  - platform: esphome
+    encryption:
+#    password: !secret ota_password
+
+# Local web UI at http://<device-ip>/ (all entities below are editable there).
+# local: true embeds the UI assets in the firmware so the page works without
+# internet access (the default loads them from a CDN); check the flash usage
+# line in the compile output after adding it.
+web_server:
+  port: 80
+  version: 3
+  local: true
+  ota: false
+  auth:
+    username: !secret web_username
+    password: !secret web_password
+    type: digest
+
+external_components:
+  - source:
+      type: git
+      url: https://github.com/daweizhangau/esphome_addressable_light_digital_display
+      ref: main
+    refresh: 0s
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  domain: !secret wifi_domain
+  enable_rrm: true
+  enable_btm: true
+  reboot_timeout: 5min
+  power_save_mode: none
+  fast_connect: true
+  ap:
+    # unique per device so you can tell them apart in fallback mode
+    ssid: "${device_name} Fallback Hotspot"
+    password: !secret wifi_fallback_password
+
+captive_portal:
+
+# ---- Manual time configuration (web UI / Home Assistant) ----
+datetime:
+  - platform: template
+    type: datetime
+    name: "Set Date & Time"
+    id: set_datetime_ctl
+    icon: "mdi:clock-edit"
+    entity_category: config
+    optimistic: true
+    set_action:
+      - lambda: |-
+          // x carries the fields the user entered, in the selected time zone.
+          // Convert to a UTC epoch and set the system clock (clock_settime is
+          // ESP-IDF's front end for settimeofday).
+          x.recalc_timestamp_local();
+          if (x.timestamp <= 0 || x.year < 2020) {
+            ESP_LOGW("manual_time", "Ignoring invalid date/time");
+            return;
+          }
+          struct timespec ts{};
+          ts.tv_sec = x.timestamp;
+          clock_settime(CLOCK_REALTIME, &ts);
+          ESP_LOGI("manual_time", "Clock set manually to %04d-%02d-%02d %02d:%02d:%02d local",
+                   x.year, x.month, x.day_of_month, x.hour, x.minute, x.second);
+      - component.update: current_time_text
+      - script.execute: apply_sun_brightness
+      # clock-rtc-pcf8563.yaml appends "pcf8563.write_time" here on RTC clocks
+
+select:
+  - platform: template
+    name: "Time Zone"
+    id: tz_select
+    icon: "mdi:map-clock"
+    entity_category: config
+    optimistic: true
+    restore_value: true
+    initial_option: ${tz_default_option}
+    # NOTE: the selection is stored in flash as the option INDEX. Once clocks
+    # are deployed, add new zones at the END of this list only; inserting or
+    # reordering would silently change every clock's stored zone.
+    # Titles show the standard-time offset. The apply_timezone script matches
+    # these exact strings, so change both places together.
+    options:
+      - "US Eastern (UTC-5)"
+      - "US Central (UTC-6)"
+      - "US Mountain (UTC-7)"
+      - "US Arizona (UTC-7, no DST)"
+      - "US Pacific (UTC-8)"
+      - "US Alaska (UTC-9)"
+      - "US Hawaii (UTC-10, no DST)"
+      - "UTC"
+      - "UK / Ireland / Portugal (UTC+0)"
+      - "Europe Central (UTC+1)"      # CET/CEST: Poland, Germany, France, Italy, Spain, ...
+      - "Europe Eastern (UTC+2)"      # EET/EEST: Ukraine, Finland, Romania, Bulgaria, Greece, ...
+      - "Fixed UTC offset"
+    on_value:
+      - script.execute: apply_timezone
+
+number:
+  # Hours EAST of UTC (ISO sign: -6 = US Central standard time, +5.5 = India),
+  # no daylight saving. Used only while "Time Zone" is "Fixed UTC offset".
+  # ESPHome cannot gray out an entity, so while a named zone is selected any
+  # edit is rejected instead: the previous value is put back (see on_value).
+  - platform: template
+    name: "UTC Offset"
+    id: tz_fixed_offset
+    icon: "mdi:earth"
+    entity_category: config
+    unit_of_measurement: "h"
+    mode: box
+    min_value: -12
+    max_value: 14
+    step: 0.25
+    initial_value: -6
+    optimistic: true
+    restore_value: true
+    on_value:
+      - lambda: |-
+          // Accept the value when it is the first one after boot (restored from
+          // flash) or when "Fixed UTC offset" is selected, and remember it.
+          const auto sel = id(tz_select).current_option();
+          if (std::isnan(id(tz_fixed_hours)) || sel.empty() || sel == "Fixed UTC offset") {
+            id(tz_fixed_hours) = x;
+          }
+      - if:
+          condition:
+            lambda: 'return id(tz_select).current_option() == "Fixed UTC offset";'
+          then:
+            - script.execute: apply_timezone
+      - if:
+          # Edited while a named zone is selected: revert to the last accepted
+          # value. Delayed so the revert reaches flash AFTER the rejected value
+          # (both go through the entity's normal set path, which also saves).
+          condition:
+            lambda: 'return fabsf(x - id(tz_fixed_hours)) > 0.001f;'
+          then:
+            - logger.log:
+                level: WARN
+                format: "UTC Offset is editable only with Time Zone = 'Fixed UTC offset'; reverting"
+            - delay: 100ms
+            - number.set:
+                id: tz_fixed_offset
+                value: !lambda 'return id(tz_fixed_hours);'
+
+text_sensor:
+  - platform: debug
+    device:
+      name: "Device Info"
+    reset_reason:
+      name: "Reset Reason"
+  - platform: template
+    name: "Current Time"
+    id: current_time_text
+    icon: "mdi:clock"
+    update_interval: 60s
+    lambda: |-
+      auto t = id(sntp_time).now();
+      if (!t.is_valid()) return {"No Time"};
+      char buffer[20];
+      sprintf(buffer, "%02d:%02d", t.hour, t.minute);
+      return {buffer};
+
+sensor:
+  - platform: uptime
+    update_interval: 10min
+    name: Uptime
+  - platform: wifi_signal
+    name: WiFi Signal
+    update_interval: 10min
+  # Diagnostic: see the ramp input in Home Assistant
+  - platform: sun
+    sun_id: sun_comp
+    name: "Sun Elevation"
+    type: elevation
+    update_interval: 5min
+    entity_category: diagnostic
+
+button:
+  - platform: restart
+    name: "Restart device"
+
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: ${timezone}
+    servers:
+      - 0.us.pool.ntp.org
+      - 1.us.pool.ntp.org
+      - 2.us.pool.ntp.org
+    on_time_sync:
+      then:
+        - component.update: current_time_text
+        - script.execute: apply_sun_brightness
+        # clock-rtc-pcf8563.yaml appends "pcf8563.write_time" here on RTC clocks
+
+sun:
+  latitude: !secret latitude
+  longitude: !secret longitude
+  id: sun_comp
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: led_strip
+    name: "DigitSegments"
+    channel_colors: GRB
+    pin: ${led_pin}
+    num_leds: ${num_leds}
+    chipset: ws2812
+    internal: true
+
+display:
+  - platform: addressable_light_digital_display
+    id: digital_clock_display
+    light_id: digital_clock_light
+    name: "Digital Clock"
+    addressable_light_id: led_strip
+    icon: "mdi:clock-digital"
+    default_transition_length: 0s
+    update_interval: 500ms
+    restore_mode: RESTORE_AND_ON
+
+    # Segment naming reference:
+    #
+    #  FW coding        Boris schema      Vlad schema
+    #
+    #      A                  5                3
+    #     ---                ---              ---
+    #  F |   | B          4 |   | 6        4 |   | 2
+    #     -G-                -7-              -1-
+    #  E |   | C          3 |   | 1        5 |   | 7
+    #     ---                ---              ---
+    #      D                  2                6
+    #
+    led_map: "${led_map}"
+
+    reverse: ${strip_reverse}   # true if strip is wired right-to-left
+
+    lambda: |-
+      // Boot IP splash, once per boot: as soon as WiFi has an address (or the
+      // fallback hotspot has started), show "IP:" and then each octet, 3 s
+      // per screen with 0.5 s dark in between, twice through; then the time.
+      // Timing counts display updates, so it relies on update_interval: 500ms
+      // (6 frames shown + 1 frame dark = 3.5 s per screen).
+      int &frame = id(ip_splash_frame);
+      if (frame < 0) {
+        auto *wifi = wifi::global_wifi_component;
+        network::IPAddress ip;
+        if (wifi->is_connected()) {
+          for (auto &a : wifi->get_ip_addresses()) {
+            if (a.is_set() && a.is_ip4()) { ip = a; break; }
+          }
+        } else if (wifi->is_ap_active()) {
+          ip = wifi->wifi_soft_ap_ip();
+        }
+        char ip_str[network::IP_ADDRESS_BUFFER_SIZE];
+        unsigned o[4];
+        if (ip.is_set() && ip.is_ip4() &&
+            sscanf(ip.str_to(ip_str), "%u.%u.%u.%u", &o[0], &o[1], &o[2], &o[3]) == 4) {
+          ESP_LOGI("ip_splash", "Showing IP %s", ip_str);
+          for (int i = 0; i < 4; i++) id(ip_octets)[i] = o[i];
+          frame = 0;
+        }
+      }
+      if (frame >= 0 && frame < 2 * 5 * 7) {
+        // 5 chars map to digit, digit, colon, digit, digit. Print the dark
+        // frame explicitly: the display keeps the last printed frame.
+        const int screen = (frame / 7) % 5;
+        if (frame % 7 == 6) {
+          it.print("     ");
+        } else if (screen == 0) {
+          it.print("IP:  ");
+        } else {
+          char d[5];
+          snprintf(d, sizeof(d), "%4u", (unsigned) id(ip_octets)[screen - 1]);
+          it.printf("%c%c %c%c", d[0], d[1], d[2], d[3]);
+        }
+        frame++;
+        return;
+      }
+
+      auto now = id(sntp_time).now();
+      const bool synced = now.is_valid();
+      if (!synced && id(saved_epoch) != 0) {
+        // Cold boot on a clock without an RTC (or with a dead RTC battery):
+        // show the last saved time plus uptime. This is stale by however long
+        // the power was off, so the colon is held steady instead of blinking.
+        now = ESPTime::from_epoch_local((time_t) id(saved_epoch) + millis() / 1000);
+      }
+      if (now.is_valid()) {
+        // Blink the colon at 1 Hz only once the time comes from a real source
+        if (!synced || millis() % 1000 < 500) {
+          it.strftime("%H:%M", now);
+        } else {
+          it.strftime("%H %M", now);
+        }
+      }
+

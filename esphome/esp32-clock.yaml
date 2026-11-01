@@ -1,0 +1,16 @@
+substitutions:
+  device_name: esp32-clock
+  friendly_name: "Clock"
+  # Seeed XIAO ESP32-C5: LED data on GPIO0. The I2C pins take effect only if
+  # the rtc package below is enabled. No Home Assistant, so no API reboot.
+  board: seeed_xiao_esp32c5
+  led_pin: GPIO0
+  i2c_sda: GPIO23
+  i2c_scl: GPIO24
+  api_reboot_timeout: 0s
+  # LED layout matches the package defaults: 116 LEDs, 4-LED-per-segment map,
+  # reverse: true
+
+packages:
+  common: !include clock-common.yaml
+  # rtc:    !include clock-rtc-pcf8563.yaml   # if the PCF8563T module is fitted
