@@ -573,11 +573,9 @@ display:
         now = ESPTime::from_epoch_local((time_t) id(saved_epoch) + millis() / 1000);
       }
       if (now.is_valid()) {
-        // Blink the colon at 1 Hz only once the time comes from a real source
-        if (!synced || millis() % 1000 < 500) {
-          it.strftime("%H:%M", now);
-        } else {
-          it.strftime("%H %M", now);
-        }
+        // Blink the colon at 1 Hz only once the time comes from a real source.
+        // %2d blanks the leading zero of single-digit hours (" 9:05").
+        const bool colon = !synced || millis() % 1000 < 500;
+        it.printf("%2d%c%02d", now.hour, colon ? ':' : ' ', now.minute);
       }
 

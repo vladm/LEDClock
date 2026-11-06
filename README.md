@@ -6,7 +6,7 @@ A DIY 4-digit 7-segment clock built from WS2812B / SK6812 LED strips in a 3D-pri
 
 ## Features
 
-- `HH:MM` display rendered by the [addressable_light_digital_display](https://github.com/daweizhangau/esphome_addressable_light_digital_display) external component. Colon blinks at 1 Hz once the time comes from a real source.
+- `HH:MM` display rendered by the [addressable_light_digital_display](https://github.com/daweizhangau/esphome_addressable_light_digital_display) external component, with no leading zero on single-digit hours (` 9:05`). Colon blinks at 1 Hz once the time comes from a real source.
 - Boot IP splash: once WiFi connects (or the fallback hotspot starts), the display shows `IP:` and then each octet of the device's IPv4 address. Each screen holds 3 s with 0.5 s dark between screens, and the sequence runs twice (35 s), then the time returns. Until WiFi is up (a few seconds after boot) the clock shows the time. Runs once per boot.
 - Auto brightness that follows the sun: a linear ramp from night to day brightness between two sun elevations (defaults: 15% at -6°, 40% at +10°), re-evaluated every 60 s. Toggle with the "Auto Brightness" switch.
 - Timekeeping from any one of three real sources:
@@ -32,6 +32,16 @@ Default pins: LED data `GPIO4`, I2C SDA `GPIO6`, SCL `GPIO7`. They suit the ESP3
 
 Wall clock schematic, Rev B002: [`media/WALL_CLOCK_SCH_Rev_B002.pdf`](media/WALL_CLOCK_SCH_Rev_B002.pdf).
 
+## PCB
+
+Front: LED strip segments, labelled per digit (`HD*` / `H*` hours, `MD*` / `M*` minutes, `SEC` colon).
+
+![Clock PCB, front with LED segments lit](media/clock-pcb-front.jpg)
+
+Back: XIAO ESP32-C5 (U2) with external antenna, PCF8563 RTC module with coin cell (U3), U1, USB-C power input.
+
+![Clock PCB, back with ESP32 and RTC module](media/clock-pcb-back.jpg)
+
 ## 3D model
 
 Printable case: [`3D-Model/Clock.3mf`](3D-Model/Clock.3mf).
@@ -42,7 +52,7 @@ _TODO: parts list, print settings, filament, assembly notes._
 
 ```
 3D-Model/Clock.3mf          printable case
-media/                      pictures, schematic (PDF)
+media/                      pictures, PCB photos, schematic (PDF)
 esphome/
   clock-common.yaml         shared package: display, brightness, time, web UI, all entities
   clock-rtc-pcf8563.yaml    optional add-on package for clocks with the PCF8563T RTC
